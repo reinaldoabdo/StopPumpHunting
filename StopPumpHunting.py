@@ -52,6 +52,10 @@ class CryptoHuntingStrategy(IStrategy):
     atr_sl_multiplier_long = DecimalParameter(0.5, 1.5, default=0.75, space="buy")
     atr_sl_multiplier_short = DecimalParameter(0.5, 1.5, default=1.0, space="sell")
     black_swan_trigger = DecimalParameter(-15, -7, default=-10, space="protection")
+    opportunity_mode = CategoricalParameter(
+        ["conservative", "balanced", "aggressive"], 
+        default="balanced", space="buy"
+    )
     
     # Configurações de proteção
     circuit_breaker_volume_drop = 0.40  # 40% queda no volume
@@ -182,6 +186,16 @@ class CryptoHuntingStrategy(IStrategy):
         dataframe['price_change'] = dataframe['close'].pct_change(5)
         dataframe['rsi_change'] = dataframe['rsi'].pct_change(5)
         dataframe['bearish_divergence'] = (
+            (dataframe['close'].shift(1) > dataframe['close'].shift(2)) & # Preço subindo
+            (dataframe['close'] > dataframe['close'].shift(1)) &
+            (dataframe['rsi'].shift(1) < dataframe['rsi'].shift(2)) & # RSI caindo
+            (dataframe['rsi'] < dataframe['rsi'].shift(1)) &
+            (dataframe['rsi'] > 70)
+        )
+        # Correção da lógica de bearish_divergence (original parecia ter um erro)
+        # A divergência bearish clássica é: Preço faz um topo mais alto, RSI faz um topo mais baixo.
+        # Simplificando para detecção em N períodos:
+        dataframe['bearish_divergence_corrected'] = (
             (dataframe['price_change'] > 0) & 
             (dataframe['rsi_change'] < 0) & 
             (dataframe['rsi'] > 70)
@@ -201,6 +215,19 @@ class CryptoHuntingStrategy(IStrategy):
         # Níveis de suporte e resistência dinâmicos
         dataframe['support_level'] = dataframe['low'].rolling(window=20).min()
         dataframe['resistance_level'] = dataframe['high'].rolling(window=20).max()
+
+        # Indicador de Sensibilidade Dinâmica
+        dataframe['volatility_index'] = dataframe['atr'] / dataframe['close']
+        dataframe['activity_ratio'] = dataframe['volume'] / dataframe['volume'].rolling(window=100, min_periods=20).mean().fillna(1) # Evitar NaN/ZeroDivision
+
+        # Auto-ajuste de parâmetros (RSI dinâmico)
+        # Criamos uma coluna para o threshold dinâmico do RSI
+        dataframe['dynamic_rsi_oversold'] = self.rsi_oversold.value # Valor padrão
+        dataframe.loc[dataframe['activity_ratio'] > 1.2, 'dynamic_rsi_oversold'] = 35  # Mais sensível
+        dataframe.loc[dataframe['activity_ratio'] <= 1.2, 'dynamic_rsi_oversold'] = self.rsi_oversold.value # Mais rigoroso (ou valor base)
+
+        # Market Pulse Monitor
+        dataframe['market_pulse'] = dataframe.apply(lambda row: self._market_pulse(row), axis=1)
         
         # Heatmap de liquidações (opcional)
         try:
@@ -212,6 +239,11 @@ class CryptoHuntingStrategy(IStrategy):
             logger.warning(f"Não foi possível obter dados de liquidações para {metadata['pair']}: {e}")
             dataframe['liquidations'] = 0
         
+        # Inicializar colunas de entrada para evitar erros em métricas de performance
+        if 'enter_long' not in dataframe.columns:
+            dataframe['enter_long'] = 0
+        if 'enter_short' not in dataframe.columns:
+            dataframe['enter_short'] = 0
         # Métricas de performance tracking
         dataframe.loc[:, 'false_breakout_success'] = (
             (dataframe['enter_long'] == 1) & 
@@ -229,23 +261,54 @@ class CryptoHuntingStrategy(IStrategy):
         """
         Sinaliza entradas baseadas em falsos rompimentos e preços inflados
         """
+        # Inicializar signal_score
+        dataframe['signal_score'] = 0
+
         # Condições para LONG (Falsos rompimentos de suporte)
-        long_conditions = (
+        base_long_conditions = (
             # Preço violou S1 mas fechou acima
             (dataframe['low'] < dataframe['s1']) &
             (dataframe['close'] > dataframe['s1']) &
             
             # Volume acima da média
             (dataframe['volume_ratio'] > self.volume_multiplier_long.value) &
-            
-            # RSI oversold
-            (dataframe['rsi'] < self.rsi_oversold.value) &
-            
+
+            # RSI oversold (usando o threshold dinâmico)
+            (dataframe['rsi'] < dataframe['dynamic_rsi_oversold']) &
+
             # MACD histograma positivo (momentum)
             (dataframe['macd_hist'] > 0) &
             
             # Não há black swan event
             (~dataframe['black_swan_signal'])
+        )
+        dataframe.loc[base_long_conditions, 'signal_score'] += 30 # rsi_oversold
+        dataframe.loc[base_long_conditions & (dataframe['volume_ratio'] > self.volume_multiplier_long.value), 'signal_score'] += 25 # volume_spike
+        dataframe.loc[base_long_conditions & (dataframe['close'] > dataframe['s1']), 'signal_score'] += 45 # pivot_confirmation (S1)
+
+        # Condições adicionais para modo AGGRESSIVE
+        aggressive_long_conditions = pd.Series(False, index=dataframe.index)
+        if self.opportunity_mode.value == "aggressive":
+            logger.info(f"Modo AGGRESSIVE ativo para {metadata['pair']}")
+            aggressive_long_conditions = (
+                (dataframe['volume'] > dataframe['volume'].shift(1) * 1.3) &
+                (dataframe['close'] > dataframe['open']) &
+                (dataframe['rsi'] < 45) # RSI um pouco menos restritivo para agressivo
+            )
+            dataframe.loc[aggressive_long_conditions, 'signal_score'] += 20 # Aggressive bonus
+
+        # Condições para Range Trading (entrada LONG)
+        range_long_conditions = (
+            (dataframe['bb_width'] < 0.05) &  # Bandas estreitas indicam range
+            (dataframe['rsi'].between(40, 60)) & # RSI em zona neutra
+            (qtpylib.crossed_above(dataframe['close'], dataframe['bb_lower'])) & # Cruzou acima da banda inferior
+            (~dataframe['black_swan_signal'])
+        )
+        dataframe.loc[range_long_conditions, 'signal_score'] += 35 # Range trading bonus
+
+        # Combinar condições de LONG
+        final_long_conditions = (
+            base_long_conditions | (aggressive_long_conditions & base_long_conditions) | range_long_conditions
         )
         
         # Condições para SHORT (Preços artificialmente inflados)
@@ -263,7 +326,7 @@ class CryptoHuntingStrategy(IStrategy):
             (dataframe['macd'] < 0) &
             
             # Divergência bearish ou expansão abrupta das bandas
-            (dataframe['bearish_divergence'] | dataframe['bb_expansion']) &
+            (dataframe['bearish_divergence_corrected'] | dataframe['bb_expansion']) &
             
             # Liquidações altas (heatmap)
             (dataframe['liquidations'] > 0) &
@@ -272,8 +335,13 @@ class CryptoHuntingStrategy(IStrategy):
             (~dataframe['black_swan_signal'])
         )
         
-        dataframe.loc[long_conditions, 'enter_long'] = 1
+        dataframe.loc[final_long_conditions, 'enter_long'] = 1
         dataframe.loc[short_conditions, 'enter_short'] = 1
+
+        # Log de modo operacional e pulso de mercado para trades potenciais
+        if final_long_conditions.any() or short_conditions.any():
+            logger.info(f"Pair: {metadata['pair']}, Mode: {self.opportunity_mode.value}, Market Pulse: {dataframe['market_pulse'].iloc[-1] if not dataframe.empty else 'N/A'}")
+            logger.info(f"Pair: {metadata['pair']}, Scores (last): {dataframe['signal_score'].iloc[-1] if not dataframe.empty else 'N/A'}")
         
         return dataframe
 
@@ -476,6 +544,23 @@ class CryptoHuntingStrategy(IStrategy):
             logger.error(f"Erro ao verificar eventos macro: {e}")
             return False
 
+    def _market_pulse(self, row: pd.Series) -> str:
+        """
+        Classifica o mercado baseado em volatilidade e volume (usado em apply).
+        """
+        # Usar valores da linha (row) que já foram calculados
+        volatility = row.get('volatility_index', 0)
+        activity = row.get('activity_ratio', 0)
+
+        # Definir thresholds (podem ser otimizados ou ajustados)
+        # Estes são exemplos, ajuste conforme necessário
+        if volatility > 0.005 and activity > 1.5: # Ex: ATR > 0.5% do preço e volume 50% acima da média
+            return "HIGH_ENERGY"
+        elif volatility < 0.0015 or activity < 0.7: # Ex: ATR < 0.15% do preço ou volume 30% abaixo da média
+            return "LOW_ENERGY"
+        else:
+            return "NORMAL"
+
     def _merge_liquidation_data(self, dataframe: DataFrame, liquidation_data: dict) -> DataFrame:
         """
         Mescla dados de liquidações com o dataframe principal
@@ -509,4 +594,4 @@ class CryptoHuntingStrategy(IStrategy):
         """
         Retorna versão da estratégia
         """
-        return "CryptoHuntingStrategy v2.1 - Stop Hunting & Pump Exploitation"
+        return "CryptoHuntingStrategy v2.2 - Adaptive Anti-Apathy"
