@@ -63,6 +63,23 @@ class CryptoHuntingStrategy(IStrategy):
     tp2_ratio = 0.25  # 25% da posição no TP2
     tp3_ratio = 0.25  # 25% da posição no TP3
     
+    # Trailing stop (ativado apenas após TP1)
+    use_exit_signal = True
+    exit_profit_only = False
+    ignore_roi_if_entry_signal = False
+    
+    # Parâmetros adicionais
+    trailing_activation_pct = DecimalParameter(0.01, 0.05, default=0.015, space="sell")
+    liquidity_threshold = DecimalParameter(0.3, 0.7, default=0.5, space="protection")
+    
+    # Eventos macro para evitar
+    macro_events = [
+        datetime(2024, 12, 18, 14, 30),  # FOMC Meeting
+        datetime(2025, 1, 15, 13, 30),   # CPI Release
+        datetime(2025, 2, 12, 14, 30),   # FOMC Meeting
+        datetime(2025, 3, 12, 13, 30),   # CPI Release
+    ]
+    
     # Proteções integradas
     @property
     def protections(self):
@@ -185,6 +202,27 @@ class CryptoHuntingStrategy(IStrategy):
         dataframe['support_level'] = dataframe['low'].rolling(window=20).min()
         dataframe['resistance_level'] = dataframe['high'].rolling(window=20).max()
         
+        # Heatmap de liquidações (opcional)
+        try:
+            # Placeholder para dados de liquidações - implementar com API externa
+            dataframe['liquidations'] = 0
+            # liquidation_data = self.dp.get_liquidations(pair, self.timeframe)
+            # dataframe = self._merge_liquidation_data(dataframe, liquidation_data)
+        except Exception as e:
+            logger.warning(f"Não foi possível obter dados de liquidações para {metadata['pair']}: {e}")
+            dataframe['liquidations'] = 0
+        
+        # Métricas de performance tracking
+        dataframe.loc[:, 'false_breakout_success'] = (
+            (dataframe['enter_long'] == 1) & 
+            (dataframe['close'].shift(-3) > dataframe['r1'])
+        ).fillna(False)
+        
+        dataframe.loc[:, 'pump_exploit_success'] = (
+            (dataframe['enter_short'] == 1) & 
+            (dataframe['close'].shift(-3) < dataframe['s1'])
+        ).fillna(False)
+        
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -226,6 +264,9 @@ class CryptoHuntingStrategy(IStrategy):
             
             # Divergência bearish ou expansão abrupta das bandas
             (dataframe['bearish_divergence'] | dataframe['bb_expansion']) &
+            
+            # Liquidações altas (heatmap)
+            (dataframe['liquidations'] > 0) &
             
             # Não há black swan event
             (~dataframe['black_swan_signal'])
@@ -270,9 +311,10 @@ class CryptoHuntingStrategy(IStrategy):
         return dataframe
 
     def custom_exit(self, pair: str, trade: Trade, current_time: datetime, 
-                   current_rate: float, current_profit: float, **kwargs) -> Optional[str]:
+                   current_rate: float, current_profit: float, **kwargs) -> Optional[Tuple[str, float]]:
         """
         Lógica de saída customizada para take profits escalonados
+        Retorna: (exit_reason, exit_percentage) ou None
         """
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         
@@ -281,25 +323,62 @@ class CryptoHuntingStrategy(IStrategy):
         
         current_candle = dataframe.iloc[-1]
         
-        # Verificar black swan events
+        # Verificar black swan events - saída total imediata
         if current_candle['black_swan_signal']:
-            return "black_swan_protection"
+            logger.critical(f"BLACK SWAN EVENT detectado para {pair} - Saída imediata total")
+            return ("black_swan_protection", 1.0)
         
-        # Take profit escalonado para longs
+        # Gerenciar take profits escalonados
         if not trade.is_short:
-            if current_rate >= current_candle['r1'] and current_profit > 0.02:
-                return "tp1_r1"
-            elif current_rate >= current_candle['r2'] and current_profit > 0.04:
-                return "tp2_r2"
-        
-        # Take profit escalonado para shorts
+            # LONG positions
+            if current_rate >= current_candle['r1'] and current_profit > 0.015:
+                # TP1: Fechar 50% da posição
+                if not hasattr(trade, 'tp1_executed') or not trade.tp1_executed:
+                    logger.info(f"TP1 atingido para {pair} - Fechando {self.tp1_ratio*100}%")
+                    trade.tp1_executed = True
+                    # Ativar trailing stop para posição restante
+                    self._activate_trailing_stop(trade)
+                    return ("tp1_r1", self.tp1_ratio)
+                    
+            elif current_rate >= current_candle['r2'] and current_profit > 0.035:
+                # TP2: Fechar mais 25% da posição
+                if hasattr(trade, 'tp1_executed') and not hasattr(trade, 'tp2_executed'):
+                    logger.info(f"TP2 atingido para {pair} - Fechando {self.tp2_ratio*100}%")
+                    trade.tp2_executed = True
+                    return ("tp2_r2", self.tp2_ratio)
+                    
         else:
-            if current_rate <= current_candle['s1'] and current_profit > 0.02:
-                return "tp1_s1"
-            elif current_rate <= current_candle['s2'] and current_profit > 0.04:
-                return "tp2_s2"
+            # SHORT positions
+            if current_rate <= current_candle['s1'] and current_profit > 0.015:
+                # TP1: Fechar 50% da posição
+                if not hasattr(trade, 'tp1_executed') or not trade.tp1_executed:
+                    logger.info(f"TP1 SHORT atingido para {pair} - Fechando {self.tp1_ratio*100}%")
+                    trade.tp1_executed = True
+                    # Ativar trailing stop para posição restante
+                    self._activate_trailing_stop(trade)
+                    return ("tp1_s1", self.tp1_ratio)
+                    
+            elif current_rate <= current_candle['s2'] and current_profit > 0.035:
+                # TP2: Fechar mais 25% da posição
+                if hasattr(trade, 'tp1_executed') and not hasattr(trade, 'tp2_executed'):
+                    logger.info(f"TP2 SHORT atingido para {pair} - Fechando {self.tp2_ratio*100}%")
+                    trade.tp2_executed = True
+                    return ("tp2_s2", self.tp2_ratio)
         
         return None
+
+    def _activate_trailing_stop(self, trade: Trade) -> None:
+        """
+        Ativa trailing stop após TP1 ser executado
+        """
+        try:
+            # Definir trailing stop para a posição restante (25% + 25% = 50%)
+            trade.trailing_stop = True
+            trade.trailing_stop_positive = self.trailing_activation_pct.value
+            trade.trailing_only_offset_is_reached = True
+            logger.info(f"Trailing stop ativado para {trade.pair} com offset {self.trailing_activation_pct.value}")
+        except Exception as e:
+            logger.error(f"Erro ao ativar trailing stop para {trade.pair}: {e}")
 
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float,
                            rate: float, time_in_force: str, current_time: datetime,
@@ -312,17 +391,47 @@ class CryptoHuntingStrategy(IStrategy):
             logger.warning(f"Par {pair} não atende critérios de liquidez mínima")
             return False
         
+        # Verificar liquidez do order book
+        if not self._check_orderbook_liquidity(pair, amount):
+            logger.warning(f"Liquidez insuficiente no order book para {pair}")
+            return False
+        
         # Verificar exposição total
         if self._get_total_exposure() + (amount * rate) > self.max_total_exposure:
             logger.warning(f"Exposição total seria excedida com este trade")
             return False
         
-        # Verificar se não há eventos macro próximos (placeholder)
+        # Verificar se não há eventos macro próximos
         if self._is_macro_event_near(current_time):
-            logger.warning(f"Evento macro próximo, evitando novo trade")
+            logger.warning(f"Evento macro próximo, evitando novo trade para {pair}")
             return False
         
+        logger.info(f"Trade confirmado para {pair} - {side} - Valor: {amount * rate:.2f}")
         return True
+
+    def _check_orderbook_liquidity(self, pair: str, amount: float) -> bool:
+        """
+        Verifica liquidez do order book antes de entrar no trade
+        """
+        try:
+            order_book = self.dp.orderbook(pair, 1)
+            if order_book and 'bids' in order_book and 'asks' in order_book:
+                if order_book['bids'] and order_book['asks']:
+                    bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
+                    ask_volume = order_book['asks'][0][1] if order_book['asks'] else 0
+                    
+                    # Verificar se há pelo menos 50% do volume necessário disponível
+                    required_volume = amount * self.liquidity_threshold.value
+                    
+                    if bid_volume < required_volume or ask_volume < required_volume:
+                        logger.warning(f"Volume insuficiente no order book: bid={bid_volume}, ask={ask_volume}, necessário={required_volume}")
+                        return False
+                    
+                    return True
+        except Exception as e:
+            logger.error(f"Erro ao verificar order book para {pair}: {e}")
+        
+        return False
 
     def _check_pair_liquidity(self, pair: str) -> bool:
         """
@@ -353,11 +462,35 @@ class CryptoHuntingStrategy(IStrategy):
 
     def _is_macro_event_near(self, current_time: datetime) -> bool:
         """
-        Verifica se há eventos macro próximos (placeholder)
+        Verifica se há eventos macro próximos (6 horas antes/depois)
         """
-        # Implementar lógica para detectar eventos como Fed meetings, CPI, etc.
-        # Por enquanto, retorna False
-        return False
+        try:
+            for event in self.macro_events:
+                # Verificar se estamos dentro de 6 horas do evento
+                time_diff = abs((current_time - event).total_seconds())
+                if time_diff < 6 * 3600:  # 6 horas em segundos
+                    logger.info(f"Evento macro próximo detectado: {event}")
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Erro ao verificar eventos macro: {e}")
+            return False
+
+    def _merge_liquidation_data(self, dataframe: DataFrame, liquidation_data: dict) -> DataFrame:
+        """
+        Mescla dados de liquidações com o dataframe principal
+        """
+        try:
+            # Implementação placeholder - substituir com API real de liquidações
+            # Exemplo: Binance Futures API, Coinglass, etc.
+            if liquidation_data and 'liquidations' in liquidation_data:
+                df_liq = pd.DataFrame(liquidation_data['liquidations'])
+                # Merge por timestamp
+                dataframe = dataframe.merge(df_liq, on='date', how='left')
+            return dataframe
+        except Exception as e:
+            logger.warning(f"Erro ao mesclar dados de liquidações: {e}")
+            return dataframe
 
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                            proposed_stake: float, min_stake: Optional[float], max_stake: float,
