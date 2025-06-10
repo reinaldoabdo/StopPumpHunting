@@ -1,2 +1,4 @@
+ATENÇÃO! Material de estudo. 
+Não funcional.
 # StopPumpHunting
-Estratégia para Freqtrade contra o mercado.
+Estudo de estratégia para Freqtrade contra o mercado.
