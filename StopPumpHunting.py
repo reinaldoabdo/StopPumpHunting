@@ -261,9 +261,6 @@ class CryptoHuntingStrategy(IStrategy):
         """
         Sinaliza entradas baseadas em falsos rompimentos e preços inflados
         """
-        # Inicializar signal_score
-        dataframe['signal_score'] = 0
-
         # Condições para LONG (Falsos rompimentos de suporte)
         base_long_conditions = (
             # Preço violou S1 mas fechou acima
@@ -282,9 +279,6 @@ class CryptoHuntingStrategy(IStrategy):
             # Não há black swan event
             (~dataframe['black_swan_signal'])
         )
-        dataframe.loc[base_long_conditions, 'signal_score'] += 30 # rsi_oversold
-        dataframe.loc[base_long_conditions & (dataframe['volume_ratio'] > self.volume_multiplier_long.value), 'signal_score'] += 25 # volume_spike
-        dataframe.loc[base_long_conditions & (dataframe['close'] > dataframe['s1']), 'signal_score'] += 45 # pivot_confirmation (S1)
 
         # Condições adicionais para modo AGGRESSIVE
         aggressive_long_conditions = pd.Series(False, index=dataframe.index)
@@ -295,7 +289,6 @@ class CryptoHuntingStrategy(IStrategy):
                 (dataframe['close'] > dataframe['open']) &
                 (dataframe['rsi'] < 45) # RSI um pouco menos restritivo para agressivo
             )
-            dataframe.loc[aggressive_long_conditions, 'signal_score'] += 20 # Aggressive bonus
 
         # Condições para Range Trading (entrada LONG)
         range_long_conditions = (
@@ -304,13 +297,12 @@ class CryptoHuntingStrategy(IStrategy):
             (qtpylib.crossed_above(dataframe['close'], dataframe['bb_lower'])) & # Cruzou acima da banda inferior
             (~dataframe['black_swan_signal'])
         )
-        dataframe.loc[range_long_conditions, 'signal_score'] += 35 # Range trading bonus
 
         # Combinar condições de LONG
         final_long_conditions = (
             base_long_conditions | (aggressive_long_conditions & base_long_conditions) | range_long_conditions
         )
-        
+
         # Condições para SHORT (Preços artificialmente inflados)
         short_conditions = (
             # RSI overbought
@@ -341,8 +333,7 @@ class CryptoHuntingStrategy(IStrategy):
         # Log de modo operacional e pulso de mercado para trades potenciais
         if final_long_conditions.any() or short_conditions.any():
             logger.info(f"Pair: {metadata['pair']}, Mode: {self.opportunity_mode.value}, Market Pulse: {dataframe['market_pulse'].iloc[-1] if not dataframe.empty else 'N/A'}")
-            logger.info(f"Pair: {metadata['pair']}, Scores (last): {dataframe['signal_score'].iloc[-1] if not dataframe.empty else 'N/A'}")
-        
+
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
