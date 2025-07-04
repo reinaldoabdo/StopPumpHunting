@@ -371,7 +371,7 @@ class StopPumpHunting(IStrategy):
             (dataframe['close'] <= dataframe['s1']) |
             
             # RSI voltou ao normal
-            (dataframe['rsi'] < 50) |
+            (dataframe['rsi'] < 30) |
             
             # Black swan event
             (dataframe['black_swan_signal'])
