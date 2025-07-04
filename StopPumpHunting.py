@@ -34,10 +34,10 @@ class StopPumpHunting(IStrategy):
     stoploss = -0.10  # Backup stoploss
     use_custom_stoploss = True
     position_adjustment_enable = True
-    can_short = True
+    can_short = False  # Desativado para operar em mercado SPOT
     
     # Configuração de alavancagem máxima
-    max_leverage = 3.0
+    # max_leverage = 3.0 # Ignorado em mercado SPOT
     
     # Configurações de capital
     max_position_size = 0.02  # 2% do capital por trade
@@ -108,19 +108,20 @@ class StopPumpHunting(IStrategy):
             }
         ]
 
-    def leverage(self, pair: str, current_time: datetime, current_rate: float,
-                 proposed_leverage: float, max_leverage: float, entry_tag: Optional[str], 
-                 side: str, **kwargs) -> float:
-        """
-        Determina alavancagem baseada na estabilidade do par
-        """
-        # Pares mais estáveis podem usar alavancagem maior
-        stable_pairs = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
-        
-        if pair in stable_pairs:
-            return min(self.max_leverage, max_leverage)
-        else:
-            return min(2.0, max_leverage)  # Máximo 2x para pares menos estáveis
+    # A função de alavancagem não é utilizada em mercado SPOT.
+    # def leverage(self, pair: str, current_time: datetime, current_rate: float,
+    #              proposed_leverage: float, max_leverage: float, entry_tag: Optional[str],
+    #              side: str, **kwargs) -> float:
+    #     """
+    #     Determina alavancagem baseada na estabilidade do par
+    #     """
+    #     # Pares mais estáveis podem usar alavancagem maior
+    #     stable_pairs = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+    #
+    #     if pair in stable_pairs:
+    #         return min(self.max_leverage, max_leverage)
+    #     else:
+    #         return min(2.0, max_leverage)  # Máximo 2x para pares menos estáveis
 
     def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                        current_rate: float, current_profit: float, **kwargs) -> float:
@@ -261,6 +262,9 @@ class StopPumpHunting(IStrategy):
         """
         Sinaliza entradas baseadas em falsos rompimentos e preços inflados
         """
+        # Inicializar signal_score
+        dataframe['signal_score'] = 0
+
         # Condições para LONG (Falsos rompimentos de suporte)
         base_long_conditions = (
             # Preço violou S1 mas fechou acima
@@ -279,6 +283,9 @@ class StopPumpHunting(IStrategy):
             # Não há black swan event
             (~dataframe['black_swan_signal'])
         )
+        dataframe.loc[base_long_conditions, 'signal_score'] += 30 # rsi_oversold
+        dataframe.loc[base_long_conditions & (dataframe['volume_ratio'] > self.volume_multiplier_long.value), 'signal_score'] += 25 # volume_spike
+        dataframe.loc[base_long_conditions & (dataframe['close'] > dataframe['s1']), 'signal_score'] += 45 # pivot_confirmation (S1)
 
         # Condições adicionais para modo AGGRESSIVE
         aggressive_long_conditions = pd.Series(False, index=dataframe.index)
@@ -289,6 +296,7 @@ class StopPumpHunting(IStrategy):
                 (dataframe['close'] > dataframe['open']) &
                 (dataframe['rsi'] < 45) # RSI um pouco menos restritivo para agressivo
             )
+            dataframe.loc[aggressive_long_conditions, 'signal_score'] += 20 # Aggressive bonus
 
         # Condições para Range Trading (entrada LONG)
         range_long_conditions = (
@@ -297,12 +305,13 @@ class StopPumpHunting(IStrategy):
             (qtpylib.crossed_above(dataframe['close'], dataframe['bb_lower'])) & # Cruzou acima da banda inferior
             (~dataframe['black_swan_signal'])
         )
+        dataframe.loc[range_long_conditions, 'signal_score'] += 35 # Range trading bonus
 
         # Combinar condições de LONG
         final_long_conditions = (
             base_long_conditions | (aggressive_long_conditions & base_long_conditions) | range_long_conditions
         )
-
+        
         # Condições para SHORT (Preços artificialmente inflados)
         short_conditions = (
             # RSI overbought
@@ -333,7 +342,8 @@ class StopPumpHunting(IStrategy):
         # Log de modo operacional e pulso de mercado para trades potenciais
         if final_long_conditions.any() or short_conditions.any():
             logger.info(f"Pair: {metadata['pair']}, Mode: {self.opportunity_mode.value}, Market Pulse: {dataframe['market_pulse'].iloc[-1] if not dataframe.empty else 'N/A'}")
-
+            logger.info(f"Pair: {metadata['pair']}, Scores (last): {dataframe['signal_score'].iloc[-1] if not dataframe.empty else 'N/A'}")
+        
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -347,6 +357,9 @@ class StopPumpHunting(IStrategy):
             
             # Reversão do momentum
             ((dataframe['rsi'] > 70) & (dataframe['macd_hist'] < 0)) |
+            
+            # Sair em divergência de baixa confirmada (melhoria para SPOT)
+            (dataframe['bearish_divergence_corrected']) |
             
             # Black swan event
             (dataframe['black_swan_signal'])
@@ -585,4 +598,4 @@ class StopPumpHunting(IStrategy):
         """
         Retorna versão da estratégia
         """
-        return "StopPumpHunting"
+        return "StopPumpHunting v1.0 - Spot"
