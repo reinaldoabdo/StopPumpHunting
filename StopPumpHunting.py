@@ -16,7 +16,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class CryptoHuntingStrategy(IStrategy):
+class StopPumpHunting(IStrategy):
     """
     Estratégia avançada para exploração de armadilhas de mercado e proteção contra black swans
     
@@ -585,4 +585,4 @@ class CryptoHuntingStrategy(IStrategy):
         """
         Retorna versão da estratégia
         """
-        return "CryptoHuntingStrategy v2.2 - Adaptive Anti-Apathy"
+        return "StopPumpHunting"
